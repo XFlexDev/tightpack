@@ -466,7 +466,7 @@ fn unpack(archive: &Path, dir: &Path, force: bool) -> Result<()> {
     Ok(())
 }
 
-fn set_meta(p: &Path, mode: u32, mtime: i64) {
+fn set_meta(p: &Path, #[cfg_attr(not(unix), allow(unused_variables))] mode: u32, mtime: i64) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
