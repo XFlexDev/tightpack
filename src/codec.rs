@@ -11,6 +11,7 @@ use crate::node::Class;
 pub const STORE: u8 = 0;
 pub const ZSTD: u8 = 1;
 pub const XZ: u8 = 2;
+pub const BROTLI: u8 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum Level {
@@ -43,6 +44,13 @@ fn zstd(data: &[u8], level: i32, window_log: u32) -> Result<Vec<u8>> {
     c.set_parameter(CParameter::NbWorkers(threads()))?;
     c.set_parameter(CParameter::ChecksumFlag(false))?;
     Ok(c.compress(data)?)
+}
+
+fn brotli_enc(data: &[u8], quality: u32) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(data.len() / 3);
+    let mut r = brotli::CompressorReader::new(data, 1 << 20, quality, 24);
+    r.read_to_end(&mut out)?;
+    Ok(out)
 }
 
 fn xz(data: &[u8], preset: u32) -> Result<Vec<u8>> {
@@ -91,6 +99,10 @@ pub fn compress(class: Class, level: Level, data: &[u8]) -> Result<(u8, Vec<u8>)
             );
             consider(ZSTD, z)?;
             consider(XZ, x)?;
+            // Brotli q11 edges out xz on text-heavy data but is slow: Max only.
+            if class == Class::Data {
+                consider(BROTLI, brotli_enc(data, 11))?;
+            }
         }
     }
     // Dense data that barely shrinks is cheaper to keep stored.
@@ -114,6 +126,14 @@ pub fn decompress(codec: u8, data: &[u8], raw_len: usize) -> Result<Vec<u8>> {
                 .take(raw_len as u64 + 1)
                 .read_to_end(&mut out)
                 .context("xz block corrupt")?;
+            out
+        }
+        BROTLI => {
+            let mut out = Vec::with_capacity(raw_len);
+            brotli::Decompressor::new(data, 1 << 20)
+                .take(raw_len as u64 + 1)
+                .read_to_end(&mut out)
+                .context("brotli block corrupt")?;
             out
         }
         c => bail!("unknown codec {c}"),

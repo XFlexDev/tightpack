@@ -33,6 +33,7 @@ walkdir = "2"
 zstd = "0.14"
 zstd-safe = { version = "8", features = ["zstdmt"] }
 filetime = "0.2"
+brotli = "9.0.0"
 
 [profile.release]
 lto = "thin"
@@ -40,4 +41,6 @@ codegen-units = 1
 opt-level = 3
 
 [dev-dependencies]
+flate2 = "1.1.10"
 tempfile = "3"
+zstd = "0.14"

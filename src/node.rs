@@ -41,6 +41,9 @@ pub const TAG_PCM: u8 = 4;
 pub const TAG_PNG_IDAT: u8 = 5;
 pub const TAG_SAME_AS: u8 = 6;
 pub const TAG_EMPTY: u8 = 7;
+pub const TAG_BCJ: u8 = 8;
+pub const TAG_GIF: u8 = 9;
+pub const TAG_ZSTD_FRAME: u8 = 10;
 
 pub const PCM_BIG_ENDIAN: u8 = 1;
 pub const PCM_UNSIGNED: u8 = 2;
@@ -76,6 +79,24 @@ pub enum Node {
     },
     /// Identical to an earlier entry.
     SameAs(u64),
+    /// x86 call/jump addresses stored as absolute positions (BCJ); the inner
+    /// recipe produces the filtered bytes.
+    Bcj {
+        arch: u8,
+        data: Box<Node>,
+    },
+    /// A GIF image's LZW payload decoded to index pixels, re-encoded on unpack.
+    /// `sizes` are the original sub-block lengths.
+    Gif {
+        min_code_size: u8,
+        sizes: Vec<u32>,
+        pixels: Box<Node>,
+    },
+    /// Re-create a zstd frame by recompressing the plain recipe at `level`.
+    ZstdFrame {
+        level: i32,
+        plain: Box<Node>,
+    },
     Empty,
 }
 
@@ -149,6 +170,29 @@ impl Node {
                 }
                 data.encode(out);
             }
+            Node::Bcj { arch, data } => {
+                out.push(TAG_BCJ);
+                out.push(*arch);
+                data.encode(out);
+            }
+            Node::Gif {
+                min_code_size,
+                sizes,
+                pixels,
+            } => {
+                out.push(TAG_GIF);
+                out.push(*min_code_size);
+                put_uv(out, sizes.len() as u64);
+                for s in sizes {
+                    put_uv(out, u64::from(*s));
+                }
+                pixels.encode(out);
+            }
+            Node::ZstdFrame { level, plain } => {
+                out.push(TAG_ZSTD_FRAME);
+                put_uv(out, *level as u64);
+                plain.encode(out);
+            }
             Node::SameAs(i) => {
                 out.push(TAG_SAME_AS);
                 put_uv(out, *i);
@@ -197,6 +241,28 @@ impl Node {
                     data: Box::new(Node::decode(c, d)?),
                 }
             }
+            TAG_BCJ => Node::Bcj {
+                arch: c.u8()?,
+                data: Box::new(Node::decode(c, d)?),
+            },
+            TAG_GIF => {
+                let min_code_size = c.u8()?;
+                let n = c.len_u()?;
+                ensure!(n <= c.buf.len(), "bad chunk count");
+                let mut sizes = Vec::with_capacity(n);
+                for _ in 0..n {
+                    sizes.push(u32::try_from(c.uv()?)?);
+                }
+                Node::Gif {
+                    min_code_size,
+                    sizes,
+                    pixels: Box::new(Node::decode(c, d)?),
+                }
+            }
+            TAG_ZSTD_FRAME => Node::ZstdFrame {
+                level: i32::try_from(c.uv()?)?,
+                plain: Box::new(Node::decode(c, d)?),
+            },
             TAG_SAME_AS => Node::SameAs(c.uv()?),
             TAG_EMPTY => Node::Empty,
             t => bail!("unknown recipe tag {t}"),
@@ -212,9 +278,12 @@ impl Node {
                 plain.walk(f);
                 corrections.walk(f);
             }
-            Node::Lepton(n) | Node::Pcm { flac: n, .. } | Node::PngIdat { data: n, .. } => {
-                n.walk(f)
-            }
+            Node::Lepton(n)
+            | Node::Pcm { flac: n, .. }
+            | Node::PngIdat { data: n, .. }
+            | Node::Bcj { data: n, .. }
+            | Node::Gif { pixels: n, .. }
+            | Node::ZstdFrame { plain: n, .. } => n.walk(f),
             _ => {}
         }
     }
@@ -231,9 +300,12 @@ impl Node {
                 plain.walk_mut(f)?;
                 corrections.walk_mut(f)?;
             }
-            Node::Lepton(n) | Node::Pcm { flac: n, .. } | Node::PngIdat { data: n, .. } => {
-                n.walk_mut(f)?
-            }
+            Node::Lepton(n)
+            | Node::Pcm { flac: n, .. }
+            | Node::PngIdat { data: n, .. }
+            | Node::Bcj { data: n, .. }
+            | Node::Gif { pixels: n, .. }
+            | Node::ZstdFrame { plain: n, .. } => n.walk_mut(f)?,
             _ => {}
         }
         Ok(())
@@ -294,6 +366,35 @@ impl Node {
                     out.write_all(chunk)?;
                     out.write_all(&h.finalize().to_be_bytes())?;
                 }
+            }
+            Node::Bcj { arch, data } => {
+                ensure!(*arch == 1, "unsupported BCJ architecture {arch}");
+                let mut filtered = data.materialize(src)?;
+                crate::filters::bcj_x86_decode(&mut filtered);
+                out.write_all(&filtered)?;
+            }
+            Node::Gif {
+                min_code_size,
+                sizes,
+                pixels,
+            } => {
+                let px = pixels.materialize(src)?;
+                let lzw = crate::filters::lzw_encode(*min_code_size, &px);
+                let total: u64 = sizes.iter().map(|s| u64::from(*s)).sum();
+                ensure!(total == lzw.len() as u64, "GIF subblock sizes mismatch");
+                out.write_all(&[*min_code_size])?;
+                let mut pos = 0usize;
+                for &s in sizes {
+                    out.write_all(&[s as u8])?;
+                    out.write_all(&lzw[pos..pos + s as usize])?;
+                    pos += s as usize;
+                }
+                out.write_all(&[0])?;
+            }
+            Node::ZstdFrame { level, plain } => {
+                let p = plain.materialize(src)?;
+                let b = zstd::bulk::compress(&p, *level).context("zstd recompression failed")?;
+                out.write_all(&b)?;
             }
             Node::SameAs(_) => bail!("SameAs is only valid as a top level recipe"),
             Node::Empty => {}

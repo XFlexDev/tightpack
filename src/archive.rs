@@ -586,6 +586,9 @@ pub struct TransformStats {
     pub deflate: u64,
     pub png: u64,
     pub pcm: u64,
+    pub gif: u64,
+    pub bcj: u64,
+    pub zstd: u64,
     pub dedup: u64,
 }
 
@@ -597,6 +600,9 @@ pub fn transform_stats(entries: &[Entry]) -> TransformStats {
             Node::Deflate { .. } => s.deflate += 1,
             Node::PngIdat { .. } => s.png += 1,
             Node::Pcm { .. } => s.pcm += 1,
+            Node::Gif { .. } => s.gif += 1,
+            Node::Bcj { .. } => s.bcj += 1,
+            Node::ZstdFrame { .. } => s.zstd += 1,
             Node::SameAs(_) => s.dedup += 1,
             _ => {}
         });

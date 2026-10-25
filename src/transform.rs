@@ -4,6 +4,7 @@
 
 use std::io::Cursor;
 
+use crate::filters;
 use crate::node::{Class, NoRefs, Node, PCM_BIG_ENDIAN, PCM_UNSIGNED};
 
 const MAX_DEPTH: u32 = 4;
@@ -15,6 +16,13 @@ pub struct Options {
     pub jpeg: bool,
     pub deflate: bool,
     pub audio: bool,
+    /// GIF image data decoded to pixels and re-encoded on unpack.
+    pub gif: bool,
+    /// BCJ filtering for x86/x86-64 executables (PE/ELF).
+    pub binary: bool,
+    /// Recompress whole zstd frames (e.g. .zst, .tar.zst) when they
+    /// re-encode to the identical bytes.
+    pub zstd: bool,
     /// Rebuild every transformed file and compare before accepting it.
     pub verify: bool,
 }
@@ -25,6 +33,9 @@ impl Default for Options {
             jpeg: true,
             deflate: true,
             audio: true,
+            gif: true,
+            binary: true,
+            zstd: true,
             verify: true,
         }
     }
@@ -62,6 +73,16 @@ fn analyze_at(data: &[u8], depth: u32, opt: &Options) -> Node {
         aiff(data)
     } else if opt.deflate && data.starts_with(b"%PDF") {
         pdf(data, depth, opt)
+    } else if opt.deflate && data.starts_with(b"wOFF") {
+        woff(data, depth, opt)
+    } else if opt.gif && data.starts_with(b"GIF8") {
+        gif(data, depth, opt)
+    } else if opt.zstd && data.starts_with(&[0x28, 0xB5, 0x2F, 0xFD]) {
+        zstd_frame(data, depth, opt)
+    } else if opt.binary && filters::is_x86_exec(data) {
+        bcj_exec(data)
+    } else if opt.deflate && is_zlib(data) {
+        zlib(data, depth, opt)
     } else {
         None
     };
@@ -566,6 +587,184 @@ fn aiff(data: &[u8]) -> Option<Node> {
         pos = body.checked_add(len)?.checked_add(len & 1)?;
     }
     None
+}
+
+/// zlib-wrapped file: 2-byte header, raw DEFLATE, 4-byte adler32.
+fn is_zlib(data: &[u8]) -> bool {
+    let (a, b) = (data[0], data[1]);
+    a & 0x0f == 8 && b & 0x20 == 0 && (u16::from(a) << 8 | u16::from(b)) % 31 == 0
+}
+
+fn zlib(data: &[u8], depth: u32, opt: &Options) -> Option<Node> {
+    let (def, used) = deflate(&data[2..], depth, opt, true)?;
+    Some(Node::concat(vec![
+        Node::raw(Class::Meta, &data[..2]),
+        def,
+        Node::raw(Class::Meta, &data[2 + used..]),
+    ]))
+}
+
+/// WOFF (v1) font: a 44-byte header, a 20-byte-per-table directory, then
+/// zlib-compressed table data. Compressed tables become deflate nodes.
+fn woff(data: &[u8], depth: u32, opt: &Options) -> Option<Node> {
+    if data.len() < 64 || be32(data, 8)? as usize != data.len() {
+        return None;
+    }
+    let num = usize::from(u16::from_be_bytes(data[12..14].try_into().ok()?));
+    let dir_end = 44usize.checked_add(20 * num)?;
+    if dir_end > data.len() {
+        return None;
+    }
+    let mut parts = vec![Node::raw(Class::Meta, &data[..dir_end])];
+    let mut cursor = dir_end;
+    let mut changed = false;
+    for i in 0..num {
+        let d = 44 + 20 * i;
+        let off = be32(data, d + 4)? as usize;
+        let clen = be32(data, d + 8)? as usize;
+        let olen = be32(data, d + 12)? as usize;
+        let end = off.checked_add(clen)?;
+        if off < cursor || end > data.len() {
+            return None;
+        }
+        parts.push(Node::raw(Class::Meta, &data[cursor..off]));
+        let body = &data[off..end];
+        let node = if clen < olen && body.len() > 2 && is_zlib(body) {
+            match deflate(&body[2..], depth, opt, true) {
+                Some((n, used)) => {
+                    changed = true;
+                    Node::concat(vec![
+                        Node::raw(Class::Meta, &body[..2]),
+                        n,
+                        Node::raw(Class::Meta, &body[2 + used..]),
+                    ])
+                }
+                None => Node::raw(classify(body), body),
+            }
+        } else {
+            Node::raw(classify(body), body)
+        };
+        parts.push(node);
+        cursor = end;
+    }
+    parts.push(Node::raw(Class::Meta, &data[cursor..]));
+    changed.then(|| Node::concat(parts))
+}
+
+/// Whole-file zstd frame: decompress it, recurse into the payload (so
+/// .tar.zst gets the tar treatment), and keep it only if recompressing with
+/// a candidate level reproduces the exact original bytes.
+fn zstd_frame(data: &[u8], depth: u32, opt: &Options) -> Option<Node> {
+    let plain = zstd::stream::decode_all(Cursor::new(data)).ok()?;
+    if plain.len() > MAX_PLAIN {
+        return None;
+    }
+    for level in [3, 19, 22, 9, 1] {
+        if zstd::bulk::compress(&plain, level).ok()?.as_slice() == data {
+            let inner = analyze_at(&plain, depth + 1, opt);
+            return Some(Node::ZstdFrame {
+                level,
+                plain: Box::new(inner),
+            });
+        }
+    }
+    None
+}
+
+/// x86 executables: normalize relative call/jump targets so identical
+/// addresses compress together. The inverse filter restores exact bytes.
+fn bcj_exec(data: &[u8]) -> Option<Node> {
+    let mut filtered = data.to_vec();
+    filters::bcj_x86_encode(&mut filtered);
+    if filtered == data {
+        return None;
+    }
+    Some(Node::Bcj {
+        arch: 1,
+        data: Box::new(Node::raw(Class::Data, &filtered)),
+    })
+}
+
+fn skip_subblocks(data: &[u8], mut pos: usize) -> Option<usize> {
+    loop {
+        let n = usize::from(*data.get(pos)?);
+        pos += 1;
+        if n == 0 {
+            return Some(pos);
+        }
+        pos = pos.checked_add(n)?;
+        if pos > data.len() {
+            return None;
+        }
+    }
+}
+
+/// GIF images: decode each image's LZW payload to index pixels. The pixels
+/// go to the data stream; on unpack the deterministic LZW encoder rebuilds
+/// the stream and the original sub-block framing is replayed.
+fn gif(data: &[u8], depth: u32, opt: &Options) -> Option<Node> {
+    if !(data.starts_with(b"GIF87a") || data.starts_with(b"GIF89a")) {
+        return None;
+    }
+    let mut pos = 6usize;
+    let packed = *data.get(pos + 4)?;
+    pos += 7;
+    if packed & 0x80 != 0 {
+        pos = pos.checked_add(3usize << ((packed & 7) + 1))?;
+    }
+    if pos > data.len() {
+        return None;
+    }
+    let mut parts = vec![Node::raw(Class::Meta, &data[..pos])];
+    let mut changed = false;
+    loop {
+        match *data.get(pos)? {
+            // Leave pos on the trailer so the final meta part includes it.
+            0x3B => break,
+            0x21 => {
+                let s = pos;
+                pos += 2;
+                pos = skip_subblocks(data, pos)?;
+                parts.push(Node::raw(Class::Meta, &data[s..pos]));
+            }
+            0x2C => {
+                let s = pos;
+                let desc = *data.get(pos + 9)?;
+                pos += 10;
+                if desc & 0x80 != 0 {
+                    pos = pos.checked_add(3usize << ((desc & 7) + 1))?;
+                }
+                parts.push(Node::raw(Class::Meta, &data[s..pos]));
+                let min_code = *data.get(pos)?;
+                pos += 1;
+                let mut sizes = Vec::new();
+                let mut payload = Vec::new();
+                loop {
+                    let n = usize::from(*data.get(pos)?);
+                    pos += 1;
+                    if n == 0 {
+                        break;
+                    }
+                    if pos.checked_add(n)? > data.len() {
+                        return None;
+                    }
+                    sizes.push(n as u32);
+                    payload.extend_from_slice(&data[pos..pos + n]);
+                    pos += n;
+                }
+                let pixels = filters::lzw_decode(min_code, &payload)?;
+                parts.push(Node::Gif {
+                    min_code_size: min_code,
+                    sizes,
+                    pixels: Box::new(analyze_at(&pixels, depth + 1, opt)),
+                });
+                changed = true;
+            }
+            _ => return None,
+        }
+    }
+    parts.push(Node::raw(Class::Meta, &data[pos..]));
+    changed.then(|| Node::concat(parts))
 }
 
 fn find(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {

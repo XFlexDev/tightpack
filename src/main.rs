@@ -51,6 +51,15 @@ enum Cmd {
         /// Do not convert PCM audio to FLAC frames
         #[arg(long)]
         no_audio: bool,
+        /// Do not decode GIF image data
+        #[arg(long)]
+        no_gif: bool,
+        /// Do not BCJ-filter x86 executables
+        #[arg(long)]
+        no_binary: bool,
+        /// Do not recompress whole zstd frames
+        #[arg(long)]
+        no_zstd: bool,
         /// Overwrite the output if it exists
         #[arg(short, long)]
         force: bool,
@@ -93,6 +102,9 @@ fn run(cli: Cli) -> Result<()> {
             no_jpeg,
             no_deflate,
             no_audio,
+            no_gif,
+            no_binary,
+            no_zstd,
             force,
         } => {
             let level = if fast {
@@ -108,6 +120,9 @@ fn run(cli: Cli) -> Result<()> {
                     jpeg: !no_jpeg,
                     deflate: !no_deflate,
                     audio: !no_audio,
+                    gif: !no_gif,
+                    binary: !no_binary,
+                    zstd: !no_zstd,
                     verify: true,
                 },
             };
@@ -352,8 +367,15 @@ fn pack(inputs: &[PathBuf], output: &Path, opts: PackOptions, force: bool) -> Re
         human(size)
     );
     println!(
-        "recompressed: {} jpeg, {} deflate streams, {} png, {} audio, {} duplicates",
-        stats.jpeg, stats.deflate, stats.png, stats.pcm, stats.dedup
+        "recompressed: {} jpeg, {} deflate streams, {} png, {} audio, {} gif, {} exe, {} zstd, {} duplicates",
+        stats.jpeg,
+        stats.deflate,
+        stats.png,
+        stats.pcm,
+        stats.gif,
+        stats.bcj,
+        stats.zstd,
+        stats.dedup
     );
     println!("wrote {}", output.display());
     Ok(())
@@ -461,6 +483,9 @@ fn describe(n: &Node) -> String {
             Node::Deflate { .. } => "deflate",
             Node::PngIdat { .. } => "png",
             Node::Pcm { .. } => "flac",
+            Node::Gif { .. } => "gif",
+            Node::Bcj { .. } => "bcj",
+            Node::ZstdFrame { .. } => "zstd",
             Node::SameAs(_) => "dup",
             _ => return,
         };
@@ -504,7 +529,7 @@ fn info(archive: &Path) -> Result<()> {
     println!("archive   {}", human(r.archive_len));
     println!("original  {} in {} entries", human(total), r.entries.len());
     let names = ["data", "coded", "meta"];
-    let codecs = ["store", "zstd", "xz"];
+    let codecs = ["store", "zstd", "xz", "brotli"];
     for (s, name) in names.iter().enumerate() {
         let bs: Vec<_> = r
             .blocks()
@@ -531,8 +556,8 @@ fn info(archive: &Path) -> Result<()> {
     }
     let s = transform_stats(&r.entries);
     println!(
-        "recompressed: {} jpeg, {} deflate streams, {} png, {} audio, {} duplicates",
-        s.jpeg, s.deflate, s.png, s.pcm, s.dedup
+        "recompressed: {} jpeg, {} deflate streams, {} png, {} audio, {} gif, {} exe, {} zstd, {} duplicates",
+        s.jpeg, s.deflate, s.png, s.pcm, s.gif, s.bcj, s.zstd, s.dedup
     );
     Ok(())
 }

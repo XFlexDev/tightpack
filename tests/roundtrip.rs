@@ -51,6 +51,89 @@ fn zlib_raw(data: &[u8]) -> Vec<u8> {
     out
 }
 
+fn adler32(data: &[u8]) -> u32 {
+    let (mut a, mut b) = (1u32, 0u32);
+    for &x in data {
+        a = (a + u32::from(x)) % 65521;
+        b = (b + a) % 65521;
+    }
+    (b << 16) | a
+}
+
+fn zlib(data: &[u8]) -> Vec<u8> {
+    let mut out = vec![0x78, 0x01];
+    out.extend(zlib_raw(data));
+    out.extend(adler32(data).to_be_bytes());
+    out
+}
+
+fn woff(table: &[u8]) -> Vec<u8> {
+    // WOFF requires compLength < origLength, so the table needs a real
+    // compressed zlib stream, not stored deflate blocks.
+    let mut comp = Vec::new();
+    {
+        use flate2::{Compression, write::ZlibEncoder};
+        let mut e = ZlibEncoder::new(&mut comp, Compression::best());
+        e.write_all(table).unwrap();
+        e.finish().unwrap();
+    }
+    let total = 44 + 20 + comp.len();
+    let mut w = Vec::new();
+    w.extend(b"wOFF");
+    w.extend([0, 1, 0, 0]); // flavor
+    w.extend((total as u32).to_be_bytes()); // length
+    w.extend(1u16.to_be_bytes()); // numTables
+    w.extend(0u16.to_be_bytes()); // reserved
+    w.extend((table.len() as u32).to_be_bytes()); // totalSfntSize
+    w.extend([0, 1, 0, 0]); // version
+    w.extend([0; 20]); // meta + priv offsets/lengths
+    w.extend(b"TEST");
+    w.extend(64u32.to_be_bytes()); // table offset
+    w.extend((comp.len() as u32).to_be_bytes());
+    w.extend((table.len() as u32).to_be_bytes());
+    w.extend(0xDEADBEEFu32.to_be_bytes());
+    w.extend(comp);
+    w
+}
+
+fn gif(pixels: &[u8], w: u16, h: u16) -> Vec<u8> {
+    let mut g = Vec::new();
+    g.extend(b"GIF89a");
+    g.extend(w.to_le_bytes());
+    g.extend(h.to_le_bytes());
+    g.extend([0xF0, 0, 0]); // GCT flag, 2-color palette
+    g.extend([0, 0, 0, 255, 255, 255]);
+    g.push(0x2C);
+    g.extend(0u16.to_le_bytes());
+    g.extend(0u16.to_le_bytes());
+    g.extend(w.to_le_bytes());
+    g.extend(h.to_le_bytes());
+    g.push(0); // no local palette
+    g.push(8); // LZW min code size
+    let lzw = tightpack::filters::lzw_encode(8, pixels);
+    for c in lzw.chunks(255) {
+        g.push(c.len() as u8);
+        g.extend(c);
+    }
+    g.push(0);
+    g.push(0x3B);
+    g
+}
+
+fn elf() -> Vec<u8> {
+    let mut e = vec![0x7f, b'E', b'L', b'F', 2, 1, 1];
+    e.extend([0; 9]);
+    e.extend(2u16.to_le_bytes()); // ET_EXEC
+    e.extend(62u16.to_le_bytes()); // x86-64
+    e.extend([0; 44]);
+    // Fake code with call/jmp rel32 sites and filler.
+    for i in 0..300u32 {
+        e.push(0xE8);
+        e.extend((i.wrapping_mul(7919)).to_le_bytes());
+    }
+    e
+}
+
 fn wav(seconds: usize) -> Vec<u8> {
     let rate = 44100u32;
     let n = rate as usize * seconds;
@@ -141,6 +224,11 @@ fn sample() -> Vec<(&'static str, Vec<u8>)> {
         ("tiny", b"hi".to_vec()),
         ("t.gz", gzip(&t)),
         ("song.wav", wav(2)),
+        ("font.woff", woff(&text(50_000))),
+        ("img.gif", gif(&noise(60_000, 7), 300, 200)),
+        ("app.elf", elf()),
+        ("blob.zlib", zlib(&text(50_000))),
+        ("pack.zst", zstd::bulk::compress(&text(50_000), 3).unwrap()),
         ("noise.bin", noise(500_000, 1)),
         (
             "fake.jpg",
@@ -171,6 +259,25 @@ fn roundtrip_all_levels() {
         pcm.node
             .walk(&mut |n| has_pcm |= matches!(n, Node::Pcm { .. }));
         assert!(has_pcm, "wav should be stored as FLAC frames");
+        let kinds = |p: &str| {
+            let e = r.entries.iter().find(|e| e.path == p).unwrap();
+            let mut s = Vec::new();
+            e.node.walk(&mut |n| {
+                s.push(match n {
+                    Node::Gif { .. } => "gif",
+                    Node::Bcj { .. } => "bcj",
+                    Node::ZstdFrame { .. } => "zstd",
+                    Node::Deflate { .. } => "deflate",
+                    _ => "",
+                })
+            });
+            s
+        };
+        assert!(kinds("img.gif").contains(&"gif"));
+        assert!(kinds("app.elf").contains(&"bcj"));
+        assert!(kinds("pack.zst").contains(&"zstd"));
+        assert!(kinds("font.woff").contains(&"deflate"));
+        assert!(kinds("blob.zlib").contains(&"deflate"));
     }
 }
 

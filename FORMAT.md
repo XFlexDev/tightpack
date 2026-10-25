@@ -52,6 +52,7 @@ contents of its blocks. A block is compressed with one codec:
 | 0 | stored |
 | 1 | one Zstandard frame (RFC 8878). Window up to 2^31; decoders must allow it |
 | 2 | one or more concatenated `.xz` streams |
+| 3 | one Brotli stream (RFC 7932) |
 
 ## Index
 
@@ -92,6 +93,9 @@ with a tag byte.
 | 5 | png_idat | uv n, n x uv size, recipe data | for each size: big-endian u32 size, `IDAT`, the next `size` bytes of data, big-endian CRC-32 of type and bytes |
 | 6 | same_as | uv entry index | the content of an earlier file entry (top level only, must not chain) |
 | 7 | empty | | nothing |
+| 8 | bcj | u8 arch, recipe | arch `1`: x86 call/jump (0xE8/0xE9 rel32) targets stored as absolute positions; subtract `(position + 5)` from each converted u32le to restore |
+| 9 | gif | u8 lzw_min_code_size, uv n, n x uv sub-block size, recipe pixels | u8 min code size, then for each size: u8 size and that many LZW bytes (the deterministic encoder output for the decoded pixels), then u8 `0` |
+| 10 | zstd_frame | uv level, recipe plain | one Zstandard frame compressed at `level` |
 
 PCM flags: bit 0 big-endian samples, bit 1 unsigned 8-bit samples (offset 128).
 Samples are written as two's complement with the given width.
@@ -105,7 +109,8 @@ STREAMINFO), decodable by any FLAC decoder.
 ## Writer behaviour (informative)
 
 The reference writer detects JPEG, PNG, ZIP (and ZIP based formats such as
-DOCX, XLSX, JAR, APK, EPUB), gzip, tar, WAV, AIFF and PDF, applies the
+DOCX, XLSX, JAR, APK, EPUB), gzip, tar, WAV, AIFF, PDF, zlib streams, WOFF
+fonts, zstd frames, GIF images and x86 executables (PE/ELF), applies the
 transforms above recursively (for example a JPEG stored inside a ZIP), rebuilds
 every transformed file and keeps the original bytes whenever the rebuild does
 not match exactly. Identical files are stored once. Each block is compressed

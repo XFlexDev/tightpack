@@ -30,7 +30,12 @@ Run `bench/run.sh <folder>` to reproduce it on your own files.
 | PNG | inflate IDAT, recompress, rebuild exactly | 10-40% |
 | PDF | inflate FlateDecode streams | 20-50% |
 | WAV, AIFF | PCM to FLAC | 30-60% |
-| text, code, binaries | solid zstd or xz, best per block | like 7z |
+| WOFF fonts | inflate each compressed table, rebuild exactly | 20-50% |
+| bare zlib streams | inflate, recompress | 20-50% |
+| GIF | decode the LZW image payload to pixels, re-encode deterministically on unpack | 5-20% |
+| zstd frames (.zst, .tar.zst) | decode, recurse into the payload, re-encode (kept only when the frame rebuilds byte-for-byte) | 10-40% |
+| x86 PE/ELF executables | BCJ: normalize call/jump targets, then compress | 5-15% |
+| text, code, binaries | solid zstd, xz or brotli, best per block | like 7z |
 | MP3, MP4, MKV, WebM, other dense data | stored in a separate stream so it doesn't hurt the rest | about 0% |
 
 Transforms nest: a JPEG inside a ZIP inside a tar.gz still gets Lepton. If a transform fails or the rebuild is not bit-exact, the original bytes are stored instead, so packing never loses data. Identical files are stored once.
@@ -53,7 +58,7 @@ tightpack test photos.tpak                 # rebuild everything and verify hashe
 tightpack info photos.tpak                 # streams, blocks, codecs
 ```
 
-Options: `--no-jpeg`, `--no-deflate`, `--no-audio` turn off individual transforms. Directories, symlinks, permissions and modification times are kept. Extraction refuses absolute paths and `..`.
+Options: `--no-jpeg`, `--no-deflate`, `--no-audio`, `--no-gif`, `--no-binary`, `--no-zstd` turn off individual transforms. Directories, symlinks, permissions and modification times are kept. Extraction refuses absolute paths and `..`.
 
 ## Library
 

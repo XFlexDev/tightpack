@@ -27,6 +27,7 @@
 
 pub mod archive;
 pub mod codec;
+pub mod filters;
 pub mod node;
 pub mod transform;
 pub mod wire;
